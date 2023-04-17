@@ -34,11 +34,14 @@
 //! // Send a ping and measure how long time it takes to get a pong back
 //! async fn ping_pong_socket(mut socket: WebSocket<ServerMsg, ClientMsg>) {
 //!     let start = Instant::now();
-//!     socket.send(Message::Item(ServerMsg::Ping)).await.ok();
+//!     socket.send(Message::Binary(ServerMsg::Ping)).await.ok();
 //!
 //!     if let Some(msg) = socket.recv().await {
 //!         match msg {
-//!             Ok(Message::Item(ClientMsg::Pong)) => {
+//!             Ok(Message::Text(ClientMsg::Pong)) => {
+//!                 println!("ping: {:?}", start.elapsed());
+//!             },
+//!             Ok(Message::Binary(ClientMsg::Pong)) => {
 //!                 println!("ping: {:?}", start.elapsed());
 //!             },
 //!             Ok(_) => {},
@@ -304,25 +307,21 @@ where
             .poll_next(cx)
             .map_err(Error::Ws)?);
 
-        if let Some(msg) = msg {
-            let msg = match msg {
-                ws::Message::Text(msg) => msg.into_bytes(),
-                ws::Message::Binary(bytes) => bytes,
-                ws::Message::Close(frame) => {
-                    return Poll::Ready(Some(Ok(Message::Close(frame))));
-                }
-                ws::Message::Ping(buf) => {
-                    return Poll::Ready(Some(Ok(Message::Ping(buf))));
-                }
-                ws::Message::Pong(buf) => {
-                    return Poll::Ready(Some(Ok(Message::Pong(buf))));
-                }
-            };
-
-            let msg = C::decode(msg).map(Message::Item).map_err(Error::Codec);
-            Poll::Ready(Some(msg))
-        } else {
-            Poll::Ready(None)
+        match msg {
+            None => Poll::Ready(None),
+            Some(ws::Message::Text(text)) => {
+                let decoded = C::decode_string(text)
+                    .map(Message::Text)
+                    .map_err(Error::Codec);
+                Poll::Ready(Some(decoded))
+            }
+            Some(ws::Message::Binary(bytes)) => {
+                let decoded = C::decode(bytes).map(Message::Binary).map_err(Error::Codec);
+                Poll::Ready(Some(decoded))
+            }
+            Some(ws::Message::Ping(buf)) => Poll::Ready(Some(Ok(Message::Ping(buf)))),
+            Some(ws::Message::Pong(buf)) => Poll::Ready(Some(Ok(Message::Pong(buf)))),
+            Some(ws::Message::Close(frame)) => Poll::Ready(Some(Ok(Message::Close(frame)))),
         }
     }
 }
@@ -340,7 +339,8 @@ where
 
     fn start_send(mut self: Pin<&mut Self>, msg: Message<S>) -> Result<(), Self::Error> {
         let msg = match msg {
-            Message::Item(buf) => ws::Message::Binary(C::encode(buf).map_err(Error::Codec)?),
+            Message::Text(msg) => ws::Message::Text(C::encode_string(&msg).map_err(Error::Codec)?),
+            Message::Binary(msg) => ws::Message::Binary(C::encode(&msg).map_err(Error::Codec)?),
             Message::Ping(buf) => ws::Message::Ping(buf),
             Message::Pong(buf) => ws::Message::Pong(buf),
             Message::Close(frame) => ws::Message::Close(frame),
@@ -368,13 +368,23 @@ pub trait Codec {
     /// The errors that can happen when using this codec.
     type Error;
 
-    /// Encode a message.
+    /// Encode a message for binary communication.
     fn encode<S>(msg: S) -> Result<Vec<u8>, Self::Error>
     where
         S: Serialize;
 
-    /// Decode a message.
+    /// Encode a message for text based communication.
+    fn encode_string<S>(msg: S) -> Result<String, Self::Error>
+    where
+        S: Serialize;
+
+    /// Decode a message for binary communication.
     fn decode<R>(buf: Vec<u8>) -> Result<R, Self::Error>
+    where
+        R: DeserializeOwned;
+
+    /// Decode a message for text based communication.
+    fn decode_string<R>(buf: String) -> Result<R, Self::Error>
     where
         R: DeserializeOwned;
 }
@@ -398,11 +408,25 @@ impl Codec for JsonCodec {
         serde_json::to_vec(&msg)
     }
 
+    fn encode_string<S>(msg: S) -> Result<String, Self::Error>
+    where
+        S: Serialize,
+    {
+        serde_json::to_string(&msg)
+    }
+
     fn decode<R>(buf: Vec<u8>) -> Result<R, Self::Error>
     where
         R: DeserializeOwned,
     {
         serde_json::from_slice(&buf)
+    }
+
+    fn decode_string<R>(buf: String) -> Result<R, Self::Error>
+    where
+        R: DeserializeOwned,
+    {
+        serde_json::from_str(&buf)
     }
 }
 
@@ -442,8 +466,10 @@ where
 /// A WebSocket message contain a value of a known type.
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum Message<T> {
-    /// An item of type `T`.
-    Item(T),
+    /// An item of type `T` encoded as text.
+    Text(T),
+    /// An item of type `T` encoded as binary.
+    Binary(T),
     /// A ping message with the specified payload
     ///
     /// The payload here must have a length less than 125 bytes
@@ -454,4 +480,17 @@ pub enum Message<T> {
     Pong(Vec<u8>),
     /// A close message with the optional close frame.
     Close(Option<ws::CloseFrame<'static>>),
+}
+
+impl<T> Message<T> {
+    /// Gets the contained item of the message.
+    ///
+    /// Returns `None` if the variant is anything but `Message::Text` or `Message::Binary`.
+    pub fn item(self) -> Option<T> {
+        match self {
+            Self::Text(t) => Some(t),
+            Self::Binary(t) => Some(t),
+            _ => None,
+        }
+    }
 }
